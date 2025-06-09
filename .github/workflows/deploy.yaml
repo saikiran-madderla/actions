@@ -1,0 +1,113 @@
+name: Full GCP Setup and Deploy to Cloud Run
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  # 🔧 Fill these with your values
+  PROJECT_ID: gcp-5ann15-nonprod-poc
+  PROJECT_NUMBER: 702703947755
+  GITHUB_USERNAME: saikiran-madderla
+  REPO_NAME: actions
+  SERVICE_ACCOUNT: github-actions
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Enable Required APIs
+        run: |
+          gcloud services enable \
+            run.googleapis.com \
+            iam.googleapis.com \
+            artifactregistry.googleapis.com \
+            cloudbuild.googleapis.com || true
+
+      - name: Create Artifact Registry Repo
+        run: |
+          gcloud artifacts repositories create repo \
+            --repository-format=docker \
+            --location=us-central1 \
+            --description="Artifact Registry for Cloud Run App" || true
+
+      - name: Create GitHub Actions Service Account
+        run: |
+          gcloud iam service-accounts create ${{ env.SERVICE_ACCOUNT }} \
+            --display-name="github-actions" || true
+
+      - name: Bind Token Creator Role (to itself for legacy cases)
+        run: |
+          gcloud iam service-accounts add-iam-policy-binding \
+            ${{ env.SERVICE_ACCOUNT }}@${{ env.PROJECT_ID }}.iam.gserviceaccount.com \
+            --member="serviceAccount:${{ env.SERVICE_ACCOUNT }}@${{ env.PROJECT_ID }}.iam.gserviceaccount.com" \
+            --role="roles/iam.serviceAccountTokenCreator" || true
+
+      - name: Allow GitHub to impersonate the SA
+        run: |
+          gcloud iam service-accounts add-iam-policy-binding \
+            ${{ env.SERVICE_ACCOUNT }}@${{ env.PROJECT_ID }}.iam.gserviceaccount.com \
+            --member="principalSet://iam.googleapis.com/projects/${{ env.PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool1/attribute.repository/${{ env.GITHUB_USERNAME }}/${{ env.REPO_NAME }}" \
+            --role="roles/iam.workloadIdentityUser" || true
+
+      - name: Allow GitHub to generate access tokens (FIX)
+        run: |
+          gcloud iam service-accounts add-iam-policy-binding \
+            ${{ env.SERVICE_ACCOUNT }}@${{ env.PROJECT_ID }}.iam.gserviceaccount.com \
+            --member="principalSet://iam.googleapis.com/projects/${{ env.PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool1/attribute.repository/${{ env.GITHUB_USERNAME }}/${{ env.REPO_NAME }}" \
+            --role="roles/iam.serviceAccountTokenCreator" || true
+
+      - name: Grant Cloud Build Role
+        run: |
+          gcloud projects add-iam-policy-binding ${{ env.PROJECT_ID }} \
+            --member="serviceAccount:${{ env.SERVICE_ACCOUNT }}@${{ env.PROJECT_ID }}.iam.gserviceaccount.com" \
+            --role="roles/cloudbuild.builds.editor" || true
+
+      - name: Grant Cloud Run Role
+        run: |
+          gcloud projects add-iam-policy-binding ${{ env.PROJECT_ID }} \
+            --member="serviceAccount:${{ env.SERVICE_ACCOUNT }}@${{ env.PROJECT_ID }}.iam.gserviceaccount.com" \
+            --role="roles/run.admin" || true
+
+      - name: Grant Artifact Registry Role
+        run: |
+          gcloud projects add-iam-policy-binding ${{ env.PROJECT_ID }} \
+            --member="serviceAccount:${{ env.SERVICE_ACCOUNT }}@${{ env.PROJECT_ID }}.iam.gserviceaccount.com" \
+            --role="roles/artifactregistry.writer" || true
+
+      - name: Allow SA to Impersonate Compute Engine Default SA
+        run: |
+          gcloud iam service-accounts add-iam-policy-binding \
+            ${{ env.PROJECT_NUMBER }}-compute@developer.gserviceaccount.com \
+            --member="serviceAccount:${{ env.SERVICE_ACCOUNT }}@${{ env.PROJECT_ID }}.iam.gserviceaccount.com" \
+            --role="roles/iam.serviceAccountUser" || true
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          token_format: 'access_token'
+          workload_identity_provider: 'projects/${{ env.PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool1/providers/github-provider1'
+          service_account: '${{ env.SERVICE_ACCOUNT }}@${{ env.PROJECT_ID }}.iam.gserviceaccount.com'
+
+      - name: Set up gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: '${{ env.PROJECT_ID }}'
+
+      - name: Build and Deploy to Cloud Run
+        run: |
+          gcloud builds submit . \
+            --tag us-central1-docker.pkg.dev/${{ env.PROJECT_ID }}/repo/git-actions
+          gcloud run deploy git-actions \
+            --image us-central1-docker.pkg.dev/${{ env.PROJECT_ID }}/repo/git-actions \
+            --region us-central1 \
+            --platform managed \
+            --allow-unauthenticated
